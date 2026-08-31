@@ -8,12 +8,15 @@ from aws_bench.logging.logger import get_logger
 from aws_bench.resource_management.ccapi.deleter import Deleter
 from aws_bench.resource_management.ccapi.exceptions import (
     ResourceExistenceCheckError,
+    ResourceExistenceHandlerFailureError,
     ResourceExistenceThrottledError,
     ResourceExistenceUnsupportedError,
     is_not_found_error,
 )
 from aws_bench.resource_management.ccapi.models import (
     CCAPI_CLIENT_CONFIG,
+    EXISTENCE_CHECK_CLIENT_CONFIG,
+    HANDLER_FAILURE_ERROR_CODES,
     THROTTLE_ERROR_CODES,
     UNSUPPORTED_CCAPI_ERROR_CODES,
     DeletionFailureEvent,
@@ -42,6 +45,16 @@ class CloudControlManager:
         self._client = build_client(
             session, "cloudcontrol", region_name=self._region_name, config=CCAPI_CLIENT_CONFIG
         )
+        # Dedicated client for the fail-closed existence check (resource_exists) with retries
+        # disabled — see EXISTENCE_CHECK_CLIENT_CONFIG. The scan/list/delete paths keep the
+        # retrying self._client; only the per-resource GetResource check runs no-retry, so a
+        # broken-handler type no longer burns 8 adaptive retries per check.
+        self._existence_client = build_client(
+            session,
+            "cloudcontrol",
+            region_name=self._region_name,
+            config=EXISTENCE_CHECK_CLIENT_CONFIG,
+        )
         self._scanner = Scanner(self._client, session=session, region_name=self._region_name)
         self._deleter = Deleter(self._client, resource_exists_fn=self.resource_exists)
         self._type_registry = TypeRegistry(
@@ -64,11 +77,19 @@ class CloudControlManager:
         return self._type_registry.generate_skip_types()
 
     def resource_exists(self, resource: Resource) -> bool:
-        """Check if a resource exists via CCAPI get_resource."""
+        """Check if a resource exists via CCAPI get_resource.
+
+        Uses the no-retry existence client (``EXISTENCE_CHECK_CLIENT_CONFIG``): this is a
+        fail-closed verification whose caller keeps the resource on any non-definitive
+        outcome, so retrying a doomed check (notably a broken-handler InternalFailure) only
+        burns latency without changing the decision.
+        """
         try:
-            self._client.get_resource(TypeName=resource.type, Identifier=resource.identifier)
+            self._existence_client.get_resource(
+                TypeName=resource.type, Identifier=resource.identifier
+            )
             return True
-        except self._client.exceptions.ResourceNotFoundException:
+        except self._existence_client.exceptions.ResourceNotFoundException:
             return False
         except Exception as exc:
             error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
@@ -84,6 +105,14 @@ class CloudControlManager:
                 logger.trace("CCAPI does not support %s: %s", resource.type, error_code)
                 raise ResourceExistenceUnsupportedError(
                     f"CCAPI does not support {resource.type}: {error_code}"
+                ) from exc
+            if error_code in HANDLER_FAILURE_ERROR_CODES:
+                # A type whose CCAPI handler is broken server-side (fails every check).
+                # High-volume during cleanup verification — TRACE, like the unsupported case.
+                logger.trace("CCAPI handler failed for %s: %s", resource.type, error_code)
+                raise ResourceExistenceHandlerFailureError(
+                    f"CCAPI handler failed for {resource.type} '{resource.identifier}': "
+                    f"{error_code}"
                 ) from exc
             if is_not_found_error(exc):
                 logger.debug("Resource gone: %s '%s'", resource.type, resource.identifier)

@@ -9,11 +9,16 @@ from botocore.exceptions import ClientError
 
 from aws_bench.resource_management.ccapi.exceptions import (
     ResourceExistenceCheckError,
+    ResourceExistenceHandlerFailureError,
     ResourceExistenceThrottledError,
     ResourceExistenceUnsupportedError,
 )
 from aws_bench.resource_management.ccapi.manager import CloudControlManager
-from aws_bench.resource_management.ccapi.models import CCAPI_CLIENT_CONFIG, Resource
+from aws_bench.resource_management.ccapi.models import (
+    CCAPI_CLIENT_CONFIG,
+    EXISTENCE_CHECK_CLIENT_CONFIG,
+    Resource,
+)
 
 # -- __init__ --
 
@@ -22,9 +27,22 @@ def test_creates_cloudcontrol_client_with_retry_config():
     session = MagicMock()
     session.region_name = "us-east-1"
     CloudControlManager(session)
-    session.client.assert_called_once_with(
+    # Two cloudcontrol clients: the retrying scan/list/delete client, and a dedicated
+    # no-retry client for the fail-closed existence check (so a broken-handler type is not
+    # retried to exhaustion on every check).
+    session.client.assert_any_call(
         "cloudcontrol", region_name="us-east-1", config=CCAPI_CLIENT_CONFIG
     )
+    session.client.assert_any_call(
+        "cloudcontrol", region_name="us-east-1", config=EXISTENCE_CHECK_CLIENT_CONFIG
+    )
+
+
+def test_existence_check_client_config_disables_retries():
+    """The existence-check client is built with retries disabled (no adaptive burn)."""
+    assert EXISTENCE_CHECK_CLIENT_CONFIG.retries == {"max_attempts": 0}  # type: ignore[attr-defined]
+    # The scan/list/delete path still retries.
+    assert CCAPI_CLIENT_CONFIG.retries["max_attempts"] == 8  # type: ignore[attr-defined]
 
 
 def test_raises_on_client_failure():
@@ -80,19 +98,24 @@ def test_resource_exists_returns_false_on_not_found():
 def test_resource_exists_raises_custom_exception_on_non_not_found_errors():
     session = MagicMock()
     ccm = CloudControlManager(session)
-    # Mirrors a Cloud Control handler InternalFailure on GetResource. This must
-    # map to the generic (unverified) error, NOT the unsupported subclass — otherwise the
-    # deleter would skip and leak a live resource.
+    # Mirrors a Cloud Control handler InternalFailure on GetResource. This maps to the
+    # dedicated handler-failure subclass — which is a ResourceExistenceCheckError but NOT the
+    # unsupported subclass, so the deleter still attempts the delete rather than skipping and
+    # leaking a live resource. It is raised on the FIRST call: the no-retry existence client
+    # means no adaptive retry burn (~18s) on the broken-handler types.
     error_response = {
         "Error": {"Code": "HandlerInternalFailureException", "Message": "Internal error occurred"}
     }
     exc = ClientError(error_response, "GetResource")
-    ccm._client.get_resource.side_effect = exc
-    ccm._client.exceptions.ResourceNotFoundException = type("RNF", (Exception,), {})
+    ccm._existence_client.get_resource.side_effect = exc
+    ccm._existence_client.exceptions.ResourceNotFoundException = type("RNF", (Exception,), {})
 
     with pytest.raises(ResourceExistenceCheckError) as exc_info:
         ccm.resource_exists(Resource("AWS::Kinesis::Stream", "bench-stream-193512"))
+    assert isinstance(exc_info.value, ResourceExistenceHandlerFailureError)
     assert not isinstance(exc_info.value, ResourceExistenceUnsupportedError)
+    # No retry burn: the doomed check is raised on the first (and only) attempt.
+    assert ccm._existence_client.get_resource.call_count == 1
 
 
 @pytest.mark.parametrize(

@@ -46,6 +46,19 @@ class ResourceExistenceUnsupportedError(ResourceExistenceCheckError):
     """
 
 
+class ResourceExistenceHandlerFailureError(ResourceExistenceCheckError):
+    """An existence check failed because CCAPI's handler for the type errored internally.
+
+    Subclasses :class:`ResourceExistenceCheckError` (so existing handlers still catch it and
+    keep/attempt the resource — this is NOT :class:`ResourceExistenceUnsupportedError`, which
+    would skip and leak a live resource), but lets callers distinguish a *server-side handler
+    fault* (HandlerErrorCode InternalFailure) from other unverified failures. A fixed set of
+    default resource types have handlers broken server-side and fail this way on every check;
+    surfacing it distinctly lets the fail-closed verification path memoize and stop re-burning
+    retries on them.
+    """
+
+
 # CCAPI wraps service-level "not found" errors as GeneralServiceException.
 # These patterns in the error message indicate the resource (or its parent) is gone.
 _NOT_FOUND_PATTERNS = ("does not exist", "is not found", "not found", "could not be found")

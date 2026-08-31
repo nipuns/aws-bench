@@ -6,6 +6,7 @@ CCAPI when selected), then filters out infrastructure and reports orphans.
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import as_completed
 from pathlib import Path
 
@@ -13,7 +14,11 @@ import boto3
 
 from aws_bench.logging.logger import get_logger, log_context
 from aws_bench.resource_management.ccapi.manager import CloudControlManager, Resource
-from aws_bench.resource_management.ccapi.models import MAX_WORKERS_HEAVY, ScanResult
+from aws_bench.resource_management.ccapi.models import (
+    MAX_WORKERS_HEAVY,
+    MAX_WORKERS_LIGHT,
+    ScanResult,
+)
 from aws_bench.resource_management.ccapi.region_resolvers import RegionResolver
 from aws_bench.resource_management.cleanup.models import (
     SWEEPABLE_INFRA_TYPES,
@@ -39,10 +44,63 @@ REGION_SCAN_ERROR_KEY = "_scan_error"
 REGION_TASK_ERROR_KEY = "_task_error"
 
 
+class ExistenceCheckCache:
+    """Thread-safe memo of CCAPI existence-check outcomes for ONE cleanup run.
+
+    Keyed ``(resource_type, identifier)`` -> "confirmed absent" bool. A cleanup runs three
+    sweep waves plus a final orphan scan, each re-checking the same diff candidates host-side;
+    the visible cost is a fixed set of default types whose CCAPI handlers are broken
+    server-side (``AWS::ControlTower::EnabledBaseline``, ``AWS::SecurityHub::Standard``) and
+    fail every check, every wave. Sharing one cache across the waves collapses those repeated
+    checks to one CCAPI call per identifier.
+
+    Scoped to a single ``CleanupManager`` run and passed into every ``AccountScanner`` it
+    builds — deliberately NOT process-global: a later cleanup constructs a fresh cache so it
+    re-checks against current AWS state. Thread-safe because the verification loop is
+    bound-parallelized and a truly-global resource (same identifier) surfaces in every region's
+    concurrent scan.
+
+    Only *stable* outcomes are memoized:
+
+    * **confirmed-absent** (drop): cleanup only ever deletes, never creates, so a resource gone
+      in an early wave stays gone for the rest of the run — safe to serve from cache.
+    * **check error** (keep): the same check fails identically on the next wave. This is the
+      whole point for the broken-handler types.
+
+    A still-EXISTING resource is intentionally NOT memoized: a later sweep phase may delete it,
+    and the next wave must observe that rather than a stale "exists".
+
+    Staleness trade-off: a resource whose check *errored* is kept for the entire run even if it
+    later becomes checkable and gone — acceptable, because fail-closed keeps a possible orphan
+    (the final orphan scan surfaces it) rather than risk masking a real one.
+    """
+
+    def __init__(self) -> None:
+        """Initialize an empty cache."""
+        self._outcomes: dict[tuple[str, str], bool] = {}
+        self._lock = threading.Lock()
+
+    def get(self, rtype: str, identifier: str) -> bool | None:
+        """Return the cached confirmed-absent outcome, or None if not memoized."""
+        with self._lock:
+            return self._outcomes.get((rtype, identifier))
+
+    def record(self, rtype: str, identifier: str, *, confirmed_absent: bool) -> None:
+        """Memoize a stable outcome (True == confirmed absent/drop, False == errored/keep)."""
+        with self._lock:
+            self._outcomes[(rtype, identifier)] = confirmed_absent
+
+
 class AccountScanner:
     """Scans an AWS account for orphaned resources across regions."""
 
-    def __init__(self, session: boto3.Session, account_id: str | None = None) -> None:
+    def __init__(
+        self,
+        session: boto3.Session,
+        account_id: str | None = None,
+        *,
+        existence_cache: ExistenceCheckCache | None = None,
+    ) -> None:
         """Initialize with a boto3 session.
 
         Args:
@@ -52,9 +110,15 @@ class AccountScanner:
                 degrades to the throttled host path, where a failed lister is
                 swallowed into ``scan_result.failed`` and the cleanup phases skip
                 that type — leaving orphaned resources undeleted.
+            existence_cache: Optional per-cleanup-run memo of host-side CCAPI
+                existence checks, shared across the run's sweep waves so the
+                broken-handler types are not re-checked on every wave. When None
+                (the default) every candidate is checked fresh — appropriate for a
+                one-shot scan with no sibling waves.
         """
         self._session = session
         self._account_id = account_id
+        self._existence_cache = existence_cache
         # Set per-run in run(): resource_type -> set of baseline Identifiers
         # to exclude from orphan reporting (the account's pre-setup defaults).
         self._baseline_ids: dict[str, set[str]] = {}
@@ -354,18 +418,41 @@ class AccountScanner:
         ``GetResource`` (ResourceNotFound) is authoritative here, so such a resource is dropped;
         a resource that still EXISTS, whose type CCAPI cannot check, or that errs is KEPT, so a
         real orphan is never masked. No-op when nothing was detected (the common clean run).
+
+        The per-candidate checks are bound-parallelized: each is an independent blocking CCAPI
+        round-trip, and a sweep can carry dozens of the broken-handler types. One shared
+        ``CloudControlManager`` (its clients are safe for concurrent calls; only construction
+        is serialized, via ``build_client``) fans out over a small pool. When an
+        ``existence_cache`` is present, outcomes memoized by an earlier wave are served without
+        re-calling CCAPI.
         """
         if not filtered:
             return filtered
+        raise_if_shutdown()
         ccm = CloudControlManager(session)
+        # Flatten to individual (type, item) checks so they run concurrently rather than serially.
+        checks = [(rtype, item) for rtype, items in filtered.items() for item in items]
+        if not checks:
+            # Types present but all with empty item lists — nothing to verify (and a
+            # zero-worker pool would be invalid).
+            return {}
+        with interruptible_executor(max_workers=min(len(checks), MAX_WORKERS_LIGHT)) as executor:
+            absent_flags = list(
+                executor.map(
+                    lambda check: self._confirmed_absent(
+                        ccm, check[0], check[1].get("Identifier", "")
+                    ),
+                    checks,
+                )
+            )
+
         result: dict[str, list[dict]] = {}
+        for (rtype, item), is_absent in zip(checks, absent_flags):
+            if not is_absent:
+                result.setdefault(rtype, []).append(item)
+
         for rtype, items in filtered.items():
-            kept = [
-                item
-                for item in items
-                if not self._confirmed_absent(ccm, rtype, item.get("Identifier", ""))
-            ]
-            dropped = len(items) - len(kept)
+            dropped = len(items) - len(result.get(rtype, []))
             if dropped:
                 # A host-side re-check corrected a stale fast-scan read.
                 logger.debug(
@@ -374,20 +461,33 @@ class AccountScanner:
                     dropped,
                     rtype,
                 )
-            if kept:
-                result[rtype] = kept
         return result
 
-    @staticmethod
-    def _confirmed_absent(ccm: CloudControlManager, rtype: str, identifier: str) -> bool:
+    def _confirmed_absent(self, ccm: CloudControlManager, rtype: str, identifier: str) -> bool:
         """True only when CCAPI GetResource definitively reports the resource gone.
 
         Any other outcome — it exists, CCAPI does not support the type, or the check errs —
         returns False so the resource is kept (a real orphan must never be silently dropped).
+
+        When an ``existence_cache`` is set, stable outcomes are memoized across a cleanup run's
+        sweep waves: a confirmed-absent (drop) is cached because a deleted resource stays gone,
+        and a check *error* is cached because it recurs identically (the broken-handler types).
+        A still-existing resource is not cached — a later phase may delete it. See
+        ``ExistenceCheckCache``.
         """
         if not identifier:
             return False
+        cache = self._existence_cache
+        if cache is not None:
+            cached = cache.get(rtype, identifier)
+            if cached is not None:
+                return cached
         try:
-            return not ccm.resource_exists(Resource(type=rtype, identifier=identifier))
-        except Exception:  # noqa: BLE001 — unsupported/transient/unknown -> keep, never mask
+            absent = not ccm.resource_exists(Resource(type=rtype, identifier=identifier))
+        except Exception:  # noqa: BLE001 — unsupported/transient/handler-failure -> keep, never mask
+            if cache is not None:
+                cache.record(rtype, identifier, confirmed_absent=False)
             return False
+        if absent and cache is not None:
+            cache.record(rtype, identifier, confirmed_absent=True)
+        return absent

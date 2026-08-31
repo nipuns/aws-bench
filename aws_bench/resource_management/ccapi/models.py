@@ -23,6 +23,22 @@ CCAPI_CLIENT_CONFIG = Config(
     max_pool_connections=max(MAX_WORKERS_HEAVY, MAX_WORKERS_LIGHT) + 10,
 )
 
+# Client config for the fail-closed GetResource existence check ONLY. Retries are
+# disabled here (``max_attempts: 0`` == one attempt, no retries): an existence check
+# resolves any non-definitive outcome — throttle, unsupported type, transient error,
+# or a server-side handler InternalFailure — by KEEPING the resource, so botocore
+# retrying can only ever turn a "keep" into a possible "drop" of a phantom. The
+# broken-handler types (AWS::ControlTower::EnabledBaseline, AWS::SecurityHub::Standard)
+# return HandlerInternalFailureException, modeled as a 5xx server fault, which the
+# adaptive retry mode retries up to 8 times (~18s/check) on every cleanup sweep
+# wave — pure waste, since the handler fails identically every time. The scan/list
+# path keeps CCAPI_CLIENT_CONFIG's retries (bulk listing genuinely benefits from
+# throttle backoff); this narrower config applies only to the per-resource check.
+EXISTENCE_CHECK_CLIENT_CONFIG = Config(
+    retries={"max_attempts": 0},
+    max_pool_connections=max(MAX_WORKERS_HEAVY, MAX_WORKERS_LIGHT) + 10,
+)
+
 CUSTOM_RESOURCE_PREFIX = "Custom::"
 SERVICE_ROLE_PREFIX = "AWSServiceRole"
 
@@ -80,6 +96,21 @@ THROTTLE_ERROR_CODES = frozenset(
         "Throttling",
         "TooManyRequestsException",
         "RequestLimitExceeded",
+    }
+)
+
+# Server-side handler faults: Cloud Control invoked the resource type's handler and it
+# failed internally (HandlerErrorCode InternalFailure). Modeled as a 5xx fault, so the
+# adaptive retry mode retries it to exhaustion. A fixed set of default resource types
+# (AWS::ControlTower::EnabledBaseline, AWS::SecurityHub::Standard, ...) have handlers
+# broken server-side and fail this way on EVERY GetResource. Kept distinct from
+# UNSUPPORTED_* so an existence check maps them to UNKNOWN (keep the resource), never
+# SKIPPED — the type is not unsupported, its handler is merely broken, so a real orphan
+# of the type must still be attempted rather than silently leaked.
+HANDLER_FAILURE_ERROR_CODES = frozenset(
+    {
+        "HandlerInternalFailureException",
+        "InternalFailure",
     }
 )
 

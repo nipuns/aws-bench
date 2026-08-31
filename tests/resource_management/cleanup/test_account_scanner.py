@@ -10,6 +10,7 @@ import pytest
 from aws_bench.resource_management.ccapi.models import ScanResult
 from aws_bench.resource_management.cleanup.account_scanner import (
     AccountScanner,
+    ExistenceCheckCache,
 )
 from aws_bench.resource_management.cleanup.models import RegionScanAggregate
 from aws_bench.resource_management.deferred import deferred_scope, mark_deferred
@@ -827,3 +828,160 @@ def test_scan_region_excludes_deferred_resources():
             result = scanner._scan_region("us-east-1", resolver)
 
     assert result.detected == {"AWS::Lambda::Function": [{"Identifier": "keep-me"}]}
+
+
+# -- ExistenceCheckCache --
+
+
+def test_existence_check_cache_memoizes_and_defaults_to_none():
+    """The cache returns None for an unseen key and the recorded bool otherwise."""
+    cache = ExistenceCheckCache()
+    assert cache.get("AWS::S3::Bucket", "b1") is None
+    cache.record("AWS::S3::Bucket", "b1", confirmed_absent=True)
+    cache.record("AWS::SecurityHub::Standard", "std-1", confirmed_absent=False)
+    assert cache.get("AWS::S3::Bucket", "b1") is True
+    assert cache.get("AWS::SecurityHub::Standard", "std-1") is False
+    # Distinct identifiers do not collide.
+    assert cache.get("AWS::S3::Bucket", "b2") is None
+
+
+# -- AccountScanner._confirmed_absent — memoization across waves --
+
+
+def test_confirmed_absent_caches_absent_and_error_but_not_exists():
+    """Absent (drop) and error (keep) are memoized; a still-existing resource is not.
+
+    The broken-handler types error on every wave, so caching the keep is the whole point; an
+    absent resource stays absent (cleanup only deletes). An existing resource is re-checked
+    because a later sweep phase may delete it.
+    """
+    from aws_bench.resource_management.ccapi.exceptions import (
+        ResourceExistenceHandlerFailureError,
+    )
+
+    cache = ExistenceCheckCache()
+    scanner = AccountScanner(MagicMock(), existence_cache=cache)
+    ccm = MagicMock()
+
+    def exists_side_effect(resource):
+        if resource.identifier == "gone":
+            return False  # confirmed absent -> drop, cache True
+        if resource.identifier == "live":
+            return True  # exists -> keep, NOT cached
+        raise ResourceExistenceHandlerFailureError("handler failed")  # keep, cache False
+
+    ccm.resource_exists.side_effect = exists_side_effect
+
+    # First wave: three distinct checks.
+    assert scanner._confirmed_absent(ccm, "AWS::S3::Bucket", "gone") is True
+    assert scanner._confirmed_absent(ccm, "AWS::S3::Bucket", "live") is False
+    assert scanner._confirmed_absent(ccm, "AWS::SecurityHub::Standard", "broken") is False
+    assert ccm.resource_exists.call_count == 3
+
+    # Second wave: absent + error served from cache (no new calls); exists re-checked.
+    assert scanner._confirmed_absent(ccm, "AWS::S3::Bucket", "gone") is True
+    assert scanner._confirmed_absent(ccm, "AWS::SecurityHub::Standard", "broken") is False
+    assert ccm.resource_exists.call_count == 3  # unchanged — both cached
+    assert scanner._confirmed_absent(ccm, "AWS::S3::Bucket", "live") is False
+    assert ccm.resource_exists.call_count == 4  # exists re-checked
+
+
+def test_second_wave_serves_broken_handler_from_cache():
+    """Two scan waves share one cache: the broken-handler check runs once, not per wave.
+
+    Mirrors the cleanup structure where CleanupManager builds a fresh AccountScanner per sweep
+    wave but threads one shared ExistenceCheckCache through them all.
+    """
+    from aws_bench.resource_management.ccapi.exceptions import (
+        ResourceExistenceHandlerFailureError,
+    )
+
+    cache = ExistenceCheckCache()
+    detected = {"AWS::ControlTower::EnabledBaseline": [{"Identifier": "eb-1"}]}
+    call_count = {"n": 0}
+
+    def exists_side_effect(resource):
+        call_count["n"] += 1
+        raise ResourceExistenceHandlerFailureError("HandlerInternalFailureException")
+
+    with patch(
+        "aws_bench.resource_management.cleanup.account_scanner.CloudControlManager"
+    ) as mock_ccm_cls:
+        mock_ccm_cls.return_value.resource_exists.side_effect = exists_side_effect
+        # Wave 1 and wave 2 each build their own scanner but share the cache.
+        for _ in range(2):
+            scanner = AccountScanner(MagicMock(), existence_cache=cache)
+            kept = scanner._drop_confirmed_absent(MagicMock(), dict(detected))
+            # Broken handler errs -> fail-closed keep, every wave.
+            assert kept == detected
+
+    assert call_count["n"] == 1  # only the first wave hit CCAPI
+
+
+def test_confirmed_absent_no_cache_rechecks_every_time():
+    """Without a cache (default), every call hits CCAPI — one-shot scans need no memo."""
+    scanner = AccountScanner(MagicMock())  # no existence_cache
+    ccm = MagicMock()
+    ccm.resource_exists.return_value = False  # absent
+    assert scanner._confirmed_absent(ccm, "AWS::S3::Bucket", "gone") is True
+    assert scanner._confirmed_absent(ccm, "AWS::S3::Bucket", "gone") is True
+    assert ccm.resource_exists.call_count == 2
+
+
+# -- AccountScanner._drop_confirmed_absent — parallel partition + keep-on-error --
+
+
+def test_drop_confirmed_absent_partitions_across_types_in_parallel():
+    """The parallelized check drops confirmed-absent, keeps existing, keeps on error.
+
+    A mixed multi-type batch verifies the flatten/rebuild preserves the keep-on-error
+    fail-closed semantic and only drops resources definitively confirmed gone.
+    """
+    from aws_bench.resource_management.ccapi.exceptions import ResourceExistenceCheckError
+
+    detected = {
+        "AWS::S3::Bucket": [{"Identifier": "gone"}, {"Identifier": "live"}],
+        "AWS::SecurityHub::Standard": [{"Identifier": "broken"}],
+        "AWS::Cognito::IdentityPool": [{"Identifier": "also-gone"}],
+    }
+
+    def exists_side_effect(resource):
+        if resource.identifier in ("gone", "also-gone"):
+            return False  # confirmed absent -> drop
+        if resource.identifier == "live":
+            return True  # exists -> keep
+        raise ResourceExistenceCheckError("handler failed")  # keep on error
+
+    with patch(
+        "aws_bench.resource_management.cleanup.account_scanner.CloudControlManager"
+    ) as mock_ccm_cls:
+        mock_ccm_cls.return_value.resource_exists.side_effect = exists_side_effect
+        scanner = AccountScanner(MagicMock())
+        result = scanner._drop_confirmed_absent(MagicMock(), detected)
+
+    # Confirmed-absent dropped: the S3 "gone" and the whole Cognito type.
+    assert result["AWS::S3::Bucket"] == [{"Identifier": "live"}]
+    assert "AWS::Cognito::IdentityPool" not in result
+    # Errored broken-handler type kept (fail-closed).
+    assert result["AWS::SecurityHub::Standard"] == [{"Identifier": "broken"}]
+
+
+def test_drop_confirmed_absent_noop_when_empty():
+    """No detected resources means no CloudControlManager is even constructed."""
+    scanner = AccountScanner(MagicMock())
+    with patch(
+        "aws_bench.resource_management.cleanup.account_scanner.CloudControlManager"
+    ) as mock_ccm_cls:
+        assert scanner._drop_confirmed_absent(MagicMock(), {}) == {}
+    mock_ccm_cls.assert_not_called()
+
+
+def test_drop_confirmed_absent_handles_types_with_empty_item_lists():
+    """A type key present with an empty list yields no checks (and no zero-worker pool)."""
+    scanner = AccountScanner(MagicMock())
+    with patch(
+        "aws_bench.resource_management.cleanup.account_scanner.CloudControlManager"
+    ) as mock_ccm_cls:
+        result = scanner._drop_confirmed_absent(MagicMock(), {"AWS::S3::Bucket": []})
+    assert result == {}
+    mock_ccm_cls.return_value.resource_exists.assert_not_called()
