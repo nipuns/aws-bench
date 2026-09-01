@@ -136,6 +136,40 @@ def test_scan_region_drops_orphan_confirmed_absent_by_host_recheck():
     assert "AWS::Cognito::IdentityPool" not in result.detected
 
 
+def test_scan_region_verify_absent_false_skips_host_recheck():
+    """Change A: the sweep scan (verify_absent=False) returns inventory without any CCAPI check.
+
+    The full-inventory host-side re-check is exactly the F4 storm; the sweep path diffs against
+    the baseline first and re-checks only the surviving residuals (via the cleanup manager's
+    ``_drop_stale_residuals``), so no CloudControlManager is even constructed here.
+    """
+    session = MagicMock()
+    scanner = AccountScanner(session)
+    with (
+        patch(
+            "aws_bench.resource_management.cleanup.account_scanner.create_regional_session",
+            return_value=session,
+        ),
+        patch(
+            "aws_bench.resource_management.cleanup.account_scanner.make_scanner"
+        ) as mock_scanner_cls,
+        patch(
+            "aws_bench.resource_management.cleanup.account_scanner.CloudControlManager"
+        ) as mock_ccm_cls,
+    ):
+        mock_scanner_cls.return_value.scan_resources.return_value = ScanResult(
+            detected={"AWS::Cognito::IdentityPool": [{"Identifier": "us-east-1:pool"}]},
+            failed={},
+        )
+        resolver = MagicMock()
+        resolver.filter_resources_by_region.side_effect = lambda region, resources: resources
+        result = scanner._scan_region("us-east-1", resolver, verify_absent=False)
+
+    # Inventory returned unmodified, and no existence check was performed.
+    assert result.detected["AWS::Cognito::IdentityPool"] == [{"Identifier": "us-east-1:pool"}]
+    mock_ccm_cls.assert_not_called()
+
+
 def test_scan_region_keeps_orphan_that_still_exists():
     """A resource the host-side re-check confirms still EXISTS is kept as a real orphan."""
     result = _scan_region_with_detected(
@@ -306,7 +340,7 @@ def test_scan_region_returns_full_scan_result():
     with patch.object(scanner, "_scan_region", return_value=scan_result) as mock_scan:
         result = scanner.scan_region("us-east-1")
     # Passes a fresh RegionResolver through to the internal per-region scan.
-    mock_scan.assert_called_once_with("us-east-1", ANY, include_infra=False)
+    mock_scan.assert_called_once_with("us-east-1", ANY, include_infra=False, verify_absent=True)
     assert result is scan_result
     assert result.detected == detected
     assert result.failed == failed
@@ -911,7 +945,7 @@ def test_second_wave_serves_broken_handler_from_cache():
         # Wave 1 and wave 2 each build their own scanner but share the cache.
         for _ in range(2):
             scanner = AccountScanner(MagicMock(), existence_cache=cache)
-            kept = scanner._drop_confirmed_absent(MagicMock(), dict(detected))
+            kept = scanner.drop_confirmed_absent(MagicMock(), dict(detected))
             # Broken handler errs -> fail-closed keep, every wave.
             assert kept == detected
 
@@ -957,7 +991,7 @@ def test_drop_confirmed_absent_partitions_across_types_in_parallel():
     ) as mock_ccm_cls:
         mock_ccm_cls.return_value.resource_exists.side_effect = exists_side_effect
         scanner = AccountScanner(MagicMock())
-        result = scanner._drop_confirmed_absent(MagicMock(), detected)
+        result = scanner.drop_confirmed_absent(MagicMock(), detected)
 
     # Confirmed-absent dropped: the S3 "gone" and the whole Cognito type.
     assert result["AWS::S3::Bucket"] == [{"Identifier": "live"}]
@@ -972,7 +1006,7 @@ def test_drop_confirmed_absent_noop_when_empty():
     with patch(
         "aws_bench.resource_management.cleanup.account_scanner.CloudControlManager"
     ) as mock_ccm_cls:
-        assert scanner._drop_confirmed_absent(MagicMock(), {}) == {}
+        assert scanner.drop_confirmed_absent(MagicMock(), {}) == {}
     mock_ccm_cls.assert_not_called()
 
 
@@ -982,6 +1016,6 @@ def test_drop_confirmed_absent_handles_types_with_empty_item_lists():
     with patch(
         "aws_bench.resource_management.cleanup.account_scanner.CloudControlManager"
     ) as mock_ccm_cls:
-        result = scanner._drop_confirmed_absent(MagicMock(), {"AWS::S3::Bucket": []})
+        result = scanner.drop_confirmed_absent(MagicMock(), {"AWS::S3::Bucket": []})
     assert result == {}
     mock_ccm_cls.return_value.resource_exists.assert_not_called()

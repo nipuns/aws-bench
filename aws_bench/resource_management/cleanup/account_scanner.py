@@ -204,7 +204,9 @@ class AccountScanner:
             failed_regions=failed_regions,
         )
 
-    def scan_region(self, region: str, *, include_infra: bool = False) -> ScanResult:
+    def scan_region(
+        self, region: str, *, include_infra: bool = False, verify_absent: bool = True
+    ) -> ScanResult:
         """Return the current per-region scan: detected resources AND failed types.
 
         A thin public wrapper over the internal per-region scan used by the
@@ -218,8 +220,22 @@ class AccountScanner:
         ``cdk-hnb659fds-*``) in the scan; by default they are filtered out. It lets
         the sweep reach the CDKToolkit stack's retained assets bucket, which CFN
         leaves behind on stack deletion.
+
+        ``verify_absent`` runs the host-side CCAPI stale-read guard
+        (``drop_confirmed_absent``) over the full scan result before returning. The
+        sweep phases pass ``False``: they diff the scan against the baseline first
+        (``find_new_resources``) and re-check only the handful of residuals that
+        survive the diff — re-checking the whole live inventory here would
+        CCAPI-``GetResource`` every account-default resource on every sweep wave.
+        The final orphan scan (``run``) leaves it ``True``, since it has no
+        subsequent diff to bound the check.
         """
-        return self._scan_region(region, RegionResolver(self._session), include_infra=include_infra)
+        return self._scan_region(
+            region,
+            RegionResolver(self._session),
+            include_infra=include_infra,
+            verify_absent=verify_absent,
+        )
 
     def _write_scan_results(
         self, scan_result: ScanResult, total_orphaned: int, output_dir: Path
@@ -324,13 +340,21 @@ class AccountScanner:
         )
 
     def _scan_region(
-        self, region: str, resolver: RegionResolver, *, include_infra: bool = False
+        self,
+        region: str,
+        resolver: RegionResolver,
+        *,
+        include_infra: bool = False,
+        verify_absent: bool = True,
     ) -> ScanResult:
         """Scan a single region and filter results.
 
         ``resolver`` is shared across regions so global-resource region lookups
         are memoized account-wide. When ``include_infra`` is True, CDK
         bootstrap/toolkit resources are NOT filtered out (see ``scan_region``).
+        ``verify_absent`` gates the host-side CCAPI stale-read guard (see
+        ``scan_region``); the sweep path passes ``False`` and re-checks only the
+        post-diff residuals instead.
         """
         raise_if_shutdown()
         with log_context(region):
@@ -398,26 +422,32 @@ class AccountScanner:
             # Final guard against phantom orphans: the fast-scan Lambda's List/Describe can lag
             # (eventual consistency) and keep returning a just-deleted resource. Re-verify each
             # remaining orphan host-side and drop only the ones definitively confirmed gone.
-            filtered = self._drop_confirmed_absent(region_session, filtered)
+            # Skipped on the sweep path (verify_absent=False): that path diffs against the baseline
+            # first and re-checks only the surviving residuals, so re-checking the full inventory
+            # here would CCAPI-GetResource every account-default resource on every wave.
+            if verify_absent:
+                filtered = self.drop_confirmed_absent(region_session, filtered)
 
             return ScanResult(
                 detected=filtered,
                 failed={f"{region}/{key}": val for key, val in scan_result.failed.items()},
             )
 
-    def _drop_confirmed_absent(
+    def drop_confirmed_absent(
         self, session: boto3.Session, filtered: dict[str, list[dict]]
     ) -> dict[str, list[dict]]:
-        """Drop only orphans a host-side CCAPI existence check confirms are gone.
+        """Drop only resources a host-side CCAPI existence check confirms are gone.
 
-        The fast-scan Lambda's ``List*``/``Describe*`` can lag behind a deletion (eventual
-        consistency) and report a just-deleted resource as a phantom orphan — observed with a
-        Cognito identity pool whose ``ListIdentityPools``/``DescribeIdentityPool`` kept returning
-        a deleted pool at the Lambda's endpoint for well over an hour, while the host endpoint
-        (and ``delete_identity_pool``) reported it gone. A definitive host-side CCAPI
-        ``GetResource`` (ResourceNotFound) is authoritative here, so such a resource is dropped;
-        a resource that still EXISTS, whose type CCAPI cannot check, or that errs is KEPT, so a
-        real orphan is never masked. No-op when nothing was detected (the common clean run).
+        Runs over an explicit resource set — either the full scan result (final orphan scan) or
+        the post-diff residuals a sweep phase is about to delete. The fast-scan Lambda's
+        ``List*``/``Describe*`` can lag behind a deletion (eventual consistency) and report a
+        just-deleted resource as a phantom — observed with a Cognito identity pool whose
+        ``ListIdentityPools``/``DescribeIdentityPool`` kept returning a deleted pool at the
+        Lambda's endpoint for well over an hour, while the host endpoint (and
+        ``delete_identity_pool``) reported it gone. A definitive host-side CCAPI ``GetResource``
+        (ResourceNotFound) is authoritative here, so such a resource is dropped; a resource that
+        still EXISTS, whose type CCAPI cannot check, or that errs is KEPT, so a real orphan is
+        never masked. No-op when nothing was passed in.
 
         The per-candidate checks are bound-parallelized: each is an independent blocking CCAPI
         round-trip, and a sweep can carry dozens of the broken-handler types. One shared
