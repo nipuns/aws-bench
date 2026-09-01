@@ -326,7 +326,9 @@ def bump_patch(version: str) -> str:
 _PINNED_PATH_KEYS = ("tasks", "scenarios", "extra_instruction_paths")
 
 
-def refresh_entry_commits(entry: dict, repo_path: Path, pin_commit: str | None) -> list[str]:
+def refresh_entry_commits(
+    entry: dict, repo_path: Path, pin_commit: str | None, git_url: str | None = None
+) -> list[str]:
     """Re-resolve ``git_commit_id`` for every pinned path in ``entry`` in place.
 
     Path-driven and name-agnostic: it walks the ``tasks``, ``scenarios`` and
@@ -339,6 +341,12 @@ def refresh_entry_commits(entry: dict, repo_path: Path, pin_commit: str | None) 
     If ``pin_commit`` is given, every pin is set to that hash instead. Paths
     with no resolvable history are left at their previous pin and returned so
     the caller can warn. Returns the list of paths that could not be resolved.
+
+    ``git_url`` repoints every pinned entry at that repo. It must be applied
+    here as well as in ``build_scenario_entry``, or a composite dataset would
+    keep the previous URL while receiving a commit resolved from
+    ``repo_path`` -- pinning a fork-only SHA to the upstream URL, which no
+    clone can resolve.
     """
     unresolved: list[str] = []
 
@@ -356,12 +364,16 @@ def refresh_entry_commits(entry: dict, repo_path: Path, pin_commit: str | None) 
             rel = item.get("path")
             if rel:
                 item["git_commit_id"] = commit_for(rel, item.get("git_commit_id"))
+                if git_url is not None:
+                    item["git_url"] = git_url
 
     for metric in entry.get("metrics", []):
         kwargs = metric.get("kwargs", {})
         rel = kwargs.get("script_path")
         if rel:
             kwargs["git_commit_id"] = commit_for(rel, kwargs.get("git_commit_id"))
+            if git_url is not None:
+                kwargs["git_url"] = git_url
 
     return unresolved
 
@@ -600,14 +612,16 @@ def main():
             if entry is None:
                 entry = copy.deepcopy(prev)
                 unresolved_paths.extend(
-                    refresh_entry_commits(entry, datasets_path, args.git_commit)
+                    refresh_entry_commits(entry, datasets_path, args.git_commit, args.git_url)
                 )
         else:
             # Composite/manual dataset (or a directory-backed scenario outside
             # the reconcile set): refresh commit pins by path, preserve
             # everything else (name, description, membership) exactly as authored.
             entry = copy.deepcopy(prev)
-            unresolved_paths.extend(refresh_entry_commits(entry, datasets_path, args.git_commit))
+            unresolved_paths.extend(
+                refresh_entry_commits(entry, datasets_path, args.git_commit, args.git_url)
+            )
 
         resolve_version(entry, prev, args.no_auto_bump, bumped)
         registry.append(entry)
