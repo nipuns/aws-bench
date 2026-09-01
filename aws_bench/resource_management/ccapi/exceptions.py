@@ -56,6 +56,21 @@ class ResourceExistenceHandlerFailureError(ResourceExistenceCheckError):
     default resource types have handlers broken server-side and fail this way on every check;
     surfacing it distinctly lets the fail-closed verification path memoize and stop re-burning
     retries on them.
+
+    This class is deliberately treated as *non-recoverable* by the existence-check retry: the
+    handler fails identically on every attempt, so retrying only burns latency.
+    """
+
+
+class ResourceExistenceTransientError(ResourceExistenceCheckError):
+    """An existence check hit a transient fault (server 5xx or a connection/timeout error).
+
+    Subclasses :class:`ResourceExistenceCheckError` (so existing handlers still keep the
+    resource) but marks the failure as *recoverable*, so the existence-check retry re-attempts
+    it — distinct from a broken-handler fault (:class:`ResourceExistenceHandlerFailureError`,
+    non-recoverable) which shares the same 5xx class but never succeeds. Keeping transient
+    faults retryable is what preserves reset/verification resilience: a momentary blip must not
+    fail those paths closed on the first attempt.
     """
 
 

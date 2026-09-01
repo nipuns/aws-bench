@@ -5,12 +5,13 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from aws_bench.resource_management.ccapi.exceptions import (
     ResourceExistenceCheckError,
     ResourceExistenceHandlerFailureError,
     ResourceExistenceThrottledError,
+    ResourceExistenceTransientError,
     ResourceExistenceUnsupportedError,
 )
 from aws_bench.resource_management.ccapi.manager import CloudControlManager
@@ -125,16 +126,75 @@ def test_resource_exists_raises_custom_exception_on_non_not_found_errors():
 def test_resource_exists_raises_throttled_error_on_throttle_codes(throttle_code):
     """A throttle raises the throttle subclass, not the generic unsupported error.
 
-    Otherwise verification buckets it as SKIPPED and silently drops the resource.
+    Otherwise verification buckets it as SKIPPED and silently drops the resource. A throttle is
+    RECOVERABLE, so the existence check retries it up to EXISTENCE_CHECK_MAX_ATTEMPTS before
+    re-raising (keeping the reset/verification callers resilient to a momentary throttle).
     """
+    from aws_bench.resource_management.ccapi.models import EXISTENCE_CHECK_MAX_ATTEMPTS
+
     session = MagicMock()
     ccm = CloudControlManager(session)
     exc = ClientError({"Error": {"Code": throttle_code, "Message": "slow down"}}, "GetResource")
-    ccm._client.get_resource.side_effect = exc
-    ccm._client.exceptions.ResourceNotFoundException = type("RNF", (Exception,), {})
+    ccm._existence_client.get_resource.side_effect = exc
+    ccm._existence_client.exceptions.ResourceNotFoundException = type("RNF", (Exception,), {})
 
-    with pytest.raises(ResourceExistenceThrottledError):
+    with (
+        patch("aws_bench.resource_management.ccapi.manager._existence_check_sleep"),
+        pytest.raises(ResourceExistenceThrottledError),
+    ):
         ccm.resource_exists(Resource("AWS::S3::Bucket", "my-bucket"))
+    # Recoverable: retried the full attempt budget before giving up.
+    assert ccm._existence_client.get_resource.call_count == EXISTENCE_CHECK_MAX_ATTEMPTS
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [
+        ClientError(
+            {
+                "Error": {"Code": "ServiceInternalError", "Message": "boom"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            "GetResource",
+        ),
+        EndpointConnectionError(endpoint_url="https://cloudcontrol.us-east-1.amazonaws.com"),
+    ],
+)
+def test_resource_exists_retries_transient_faults(transient):
+    """A transient fault (5xx or connection error) is RECOVERABLE and retried, then re-raised."""
+    from aws_bench.resource_management.ccapi.models import EXISTENCE_CHECK_MAX_ATTEMPTS
+
+    session = MagicMock()
+    ccm = CloudControlManager(session)
+    ccm._existence_client.get_resource.side_effect = transient
+    ccm._existence_client.exceptions.ResourceNotFoundException = type("RNF", (Exception,), {})
+
+    with (
+        patch("aws_bench.resource_management.ccapi.manager._existence_check_sleep"),
+        pytest.raises(ResourceExistenceTransientError),
+    ):
+        ccm.resource_exists(Resource("AWS::S3::Bucket", "my-bucket"))
+    assert ccm._existence_client.get_resource.call_count == EXISTENCE_CHECK_MAX_ATTEMPTS
+
+
+def test_resource_exists_handler_failure_is_not_retried():
+    """A broken-handler fault is NON-recoverable: raised on the first attempt (no retry burn)."""
+    session = MagicMock()
+    ccm = CloudControlManager(session)
+    exc = ClientError(
+        {"Error": {"Code": "HandlerInternalFailureException", "Message": "internal"}},
+        "GetResource",
+    )
+    ccm._existence_client.get_resource.side_effect = exc
+    ccm._existence_client.exceptions.ResourceNotFoundException = type("RNF", (Exception,), {})
+
+    with (
+        patch("aws_bench.resource_management.ccapi.manager._existence_check_sleep") as mock_sleep,
+        pytest.raises(ResourceExistenceHandlerFailureError),
+    ):
+        ccm.resource_exists(Resource("AWS::ControlTower::EnabledBaseline", "arn:...:baseline/x"))
+    assert ccm._existence_client.get_resource.call_count == 1
+    mock_sleep.assert_not_called()
 
 
 def test_throttled_error_is_a_resource_existence_check_error():

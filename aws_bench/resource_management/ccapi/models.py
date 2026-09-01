@@ -23,21 +23,26 @@ CCAPI_CLIENT_CONFIG = Config(
     max_pool_connections=max(MAX_WORKERS_HEAVY, MAX_WORKERS_LIGHT) + 10,
 )
 
-# Client config for the fail-closed GetResource existence check ONLY. Retries are
-# disabled here (``max_attempts: 0`` == one attempt, no retries): an existence check
-# resolves any non-definitive outcome — throttle, unsupported type, transient error,
-# or a server-side handler InternalFailure — by KEEPING the resource, so botocore
-# retrying can only ever turn a "keep" into a possible "drop" of a phantom. The
-# broken-handler types (AWS::ControlTower::EnabledBaseline, AWS::SecurityHub::Standard)
-# return HandlerInternalFailureException, modeled as a 5xx server fault, which the
-# adaptive retry mode retries up to 8 times (~18s/check) on every cleanup sweep
-# wave — pure waste, since the handler fails identically every time. The scan/list
-# path keeps CCAPI_CLIENT_CONFIG's retries (bulk listing genuinely benefits from
-# throttle backoff); this narrower config applies only to the per-resource check.
+# Client config for the fail-closed GetResource existence check ONLY. Botocore retries are
+# disabled here (``max_attempts: 0`` == one attempt): botocore classifies
+# HandlerInternalFailureException as a retryable 5xx fault and would retry it the full 8 adaptive
+# attempts (~49s) on the broken-handler types (AWS::ControlTower::EnabledBaseline, ...), which
+# fail identically every time — pure waste on every cleanup sweep wave. Botocore's retry
+# conditions cannot exclude a single error code, so instead of letting it retry everything, the
+# existence check re-adds retries at the application level (``resource_exists``, tenacity) for the
+# RECOVERABLE classes only — throttles and transient 5xx/connection faults — while a broken-handler
+# fault short-circuits on the first attempt. That keeps the reset/verification callers resilient to
+# a momentary blip without re-introducing the doomed-handler burn. The scan/list/delete path keeps
+# CCAPI_CLIENT_CONFIG's retries (bulk listing genuinely benefits from throttle backoff).
 EXISTENCE_CHECK_CLIENT_CONFIG = Config(
     retries={"max_attempts": 0},
     max_pool_connections=max(MAX_WORKERS_HEAVY, MAX_WORKERS_LIGHT) + 10,
 )
+
+# Total attempts for the application-level existence-check retry (see resource_exists). Small on
+# purpose: it only has to ride out a transient throttle/5xx blip, not a sustained outage, and the
+# root fix (checking only diffed residuals) means these checks are now rare.
+EXISTENCE_CHECK_MAX_ATTEMPTS = 3
 
 CUSTOM_RESOURCE_PREFIX = "Custom::"
 SERVICE_ROLE_PREFIX = "AWSServiceRole"
