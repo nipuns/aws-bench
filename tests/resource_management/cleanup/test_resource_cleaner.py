@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import boto3
 import pytest
+from moto import mock_aws
 
-from aws_bench.resource_management.ccapi.models import Resource
+from aws_bench.resource_management.ccapi.models import DeletionFailureEvent, Resource
 from aws_bench.resource_management.cleanup.models import (
     CustomDeletionResult,
     HandlerResult,
@@ -680,3 +682,64 @@ def test_custom_delete_only_does_not_invoke_barrier():
     mock_barrier.assert_not_called()
     handler.assert_called_once()
     assert result == {}
+
+
+# -- cleanup: native CloudFormation DeleteStack fallback --
+
+_CFN_TYPE = "AWS::CloudFormation::Stack"
+_CFN_TEMPLATE = '{"Resources":{"T":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"probe"}}}}'
+_CCM_PATH = "aws_bench.resource_management.cleanup.resource_cleaner.CloudControlManager"
+
+
+def _stack_names(client: object) -> set[str]:
+    return {s["StackName"] for s in client.describe_stacks()["Stacks"]}  # type: ignore[attr-defined]
+
+
+@mock_aws
+def test_cfn_fallback_deletes_ccapi_failed_out_of_baseline_stack():
+    """When CCAPI fails on an out-of-baseline stack, native DeleteStack removes it."""
+    region = "us-east-1"
+    cfn = boto3.client("cloudformation", region_name=region)
+    cfn.create_stack(StackName="agent-stack", TemplateBody=_CFN_TEMPLATE)
+
+    cleaner = ResourceCleaner(boto3.Session(region_name=region), region)
+    resources = [StackResource("L", "agent-stack", _CFN_TYPE, "CREATE_COMPLETE")]
+    ccapi_failure = {
+        Resource(_CFN_TYPE, "agent-stack"): DeletionFailureEvent("CCAPI cannot delete")
+    }
+
+    with patch(_CCM_PATH) as mock_ccm_cls:
+        mock_ccm_cls.return_value.delete_resources.return_value = ccapi_failure
+        result = asyncio.run(cleaner.cleanup(resources, ccapi_fallback=True))
+
+    assert result == {}  # the stack no longer counts as a failure
+    assert "agent-stack" not in _stack_names(cfn)  # and is actually gone
+
+
+@mock_aws
+def test_cfn_fallback_leaves_infra_stack_untouched():
+    """A CDK bootstrap/toolkit (baseline infra) stack is never deleted by the fallback."""
+    region = "us-east-1"
+    cfn = boto3.client("cloudformation", region_name=region)
+    cfn.create_stack(StackName="CDKToolkit", TemplateBody=_CFN_TEMPLATE)
+
+    cleaner = ResourceCleaner(boto3.Session(region_name=region), region)
+    resources = [StackResource("L", "CDKToolkit", _CFN_TYPE, "CREATE_COMPLETE")]
+    infra_key = Resource(_CFN_TYPE, "CDKToolkit")
+
+    with patch(_CCM_PATH) as mock_ccm_cls:
+        mock_ccm_cls.return_value.delete_resources.return_value = {
+            infra_key: DeletionFailureEvent("CCAPI cannot delete")
+        }
+        result = asyncio.run(cleaner.cleanup(resources, ccapi_fallback=True))
+
+    assert infra_key in result  # still surfaced as a failure, not silently dropped
+    assert "CDKToolkit" in _stack_names(cfn)  # untouched
+
+
+def test_cfn_fallback_is_noop_without_stack_failures():
+    """No CloudFormation-stack failures means no client is built and failures pass through."""
+    cleaner = ResourceCleaner(MagicMock())
+    failures = {Resource("AWS::S3::Bucket", "bucket"): DeletionFailureEvent("boom")}
+
+    assert cleaner._delete_failed_cfn_stacks(dict(failures)) == failures
