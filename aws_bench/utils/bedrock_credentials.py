@@ -17,14 +17,20 @@ from aws_bench.logging.logger import get_logger
 
 logger = get_logger(__name__)
 
-IAM_USER_NAME = "bedrock-api-user"
+IAM_USER_NAME = "awsbench-saggarn-campaign2"
 SERVICE_NAME = "bedrock.amazonaws.com"
 POLICY_ARN = "arn:aws:iam::aws:policy/AmazonBedrockFullAccess"
 SSM_REGION = "us-east-1"
-SSM_PARAMETER = "/bedrock-aws-bench/bedrock-api-key"
+SSM_PARAMETER = "/saggarn/campaign2/bedrock-api-key"
 
 DEFAULT_DAYS = 30
 DEFAULT_MIN_REMAINING_DAYS = 1
+
+# Greppable marker for the fork-only, single-tenant credential policy: the
+# worker path never deletes a credential, so a genuinely dead or unmakeable key
+# is surfaced to an operator instead of being rotated (which would 403 every
+# concurrent lane holding it). See generate_bearer_token.
+MANUAL_MINT_ERROR_PREFIX = "BEDROCK_KEY_INVALID_MANUAL_MINT_REQUIRED"
 
 # HTTP statuses that indicate a transient condition on the verification probe
 # (throttling / server-side load), not a statement about the key's validity.
@@ -267,6 +273,74 @@ def _rotate_credential(
     return api_key
 
 
+def _manual_mint_error(detail: str) -> BedrockCredentialError:
+    """Build the greppable 'operator must re-mint' error used by the worker path."""
+    return BedrockCredentialError(
+        f"{MANUAL_MINT_ERROR_PREFIX}: {detail} An operator must re-mint with "
+        "`aws-bench env creds --force` and wait ~10 minutes for IAM propagation "
+        "before re-firing."
+    )
+
+
+def _mint_and_store_without_delete(
+    iam_client,
+    ssm_client,
+    existing: list[dict],
+    *,
+    days: int,
+    no_verify: bool,
+) -> str:
+    """Mint a new credential and store it in SSM WITHOUT deleting anything.
+
+    The bootstrap path (no cached key in SSM). It never calls
+    ``_delete_all_credentials``: if both IAM slots are already occupied a mint
+    would require a destructive delete, so we refuse and require an operator
+    ``--force`` instead. A freshly minted key that hard-fails verification is
+    likewise left in place for the operator to clean up rather than deleted here.
+    """
+    if len(existing) >= 2:
+        raise _manual_mint_error(
+            "no cached Bedrock key was found in SSM and both credential slots for "
+            f"'{IAM_USER_NAME}' are already in use, so a key cannot be minted without "
+            "deleting one."
+        )
+
+    logger.info(f"Minting long-term Bedrock key (valid {days} days)...")
+    try:
+        response = iam_client.create_service_specific_credential(
+            UserName=IAM_USER_NAME, ServiceName=SERVICE_NAME, CredentialAgeDays=days
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "LimitExceeded":
+            raise _manual_mint_error(
+                "no cached Bedrock key was found and IAM reports the credential limit "
+                f"for '{IAM_USER_NAME}' is exhausted."
+            ) from e
+        raise BedrockCredentialError(f"Failed to generate key: {e}") from e
+
+    credential = response["ServiceSpecificCredential"]
+    api_key = credential["ServiceCredentialSecret"]
+    new_id = credential["ServiceSpecificCredentialId"]
+    logger.info(f"Credential ID: {new_id}")
+
+    if not no_verify:
+        logger.info("Verifying new token against Bedrock API...")
+        outcome = _verify_token(api_key)
+        if outcome is TokenVerification.INVALID:
+            # Do NOT delete on the worker path; leave cleanup to an operator --force.
+            raise _manual_mint_error(
+                "a freshly minted Bedrock key was rejected by Bedrock after the "
+                "IAM-propagation retry window."
+            )
+        if outcome is TokenVerification.INDETERMINATE:
+            logger.warning("New token verification inconclusive (transient); storing anyway.")
+        else:
+            logger.info("Token verified successfully.")
+
+    _store_token_in_ssm(ssm_client, SSM_PARAMETER, api_key)
+    return api_key
+
+
 def generate_bearer_token(
     *,
     force: bool = False,
@@ -277,72 +351,51 @@ def generate_bearer_token(
 ) -> str:
     """Generate or retrieve a cached Bedrock bearer token.
 
+    Fork-only, single-tenant policy: the default (worker) path NEVER deletes an
+    IAM credential. Because our lanes are the only consumers of this branch's
+    isolated user, rotation-on-403 (the step that 403'd in-flight lanes during
+    the campaign) is removed. The worker path instead:
+
+    - reuses a cached SSM token that verifies VALID;
+    - reuses it on an INDETERMINATE (transient 429/5xx/network) probe;
+    - reuses it with a loud WARNING when the credential is within
+      ``min_remaining_days`` of expiry (no auto-rotation);
+    - mints + stores a key only when SSM has none (bootstrap; non-destructive);
+    - raises ``BedrockCredentialError`` (prefixed with ``MANUAL_MINT_ERROR_PREFIX``)
+      when the cached key is genuinely dead (hard 403) or cannot be minted
+      without a delete — an operator must then re-mint deliberately.
+
+    ``_delete_all_credentials`` is therefore reachable ONLY through the operator
+    escape hatches ``force`` (--force) and ``reclaim_slot`` (--reclaim-slot),
+    which retain the graceful mint -> verify -> store -> delete-old rotation.
+
     Args:
-        force: Delete existing credentials and generate fresh.
-        no_verify: Skip token verification against Bedrock API.
+        force: Operator hatch. Delete existing credentials and mint fresh.
+        no_verify: Skip token verification against the Bedrock API.
         days: Credential lifetime in days.
-        min_remaining_days: Minimum remaining days to consider a credential reusable.
-        reclaim_slot: When both service-specific credential slots are in use and a
-            rotation is required, authorize deleting the soonest-to-expire
-            credential to free a slot. Off by default so a caller who manages
-            ``bedrock-api-user`` themselves is never surprised by a deletion;
-            ``force`` implies it.
+        min_remaining_days: Below this remaining life a cached key is used with a
+            warning rather than rotated.
+        reclaim_slot: Operator hatch. Triggers a rotation and, when both credential
+            slots are full, frees the soonest-to-expire one.
 
     Returns:
         The bearer token string.
 
     Raises:
-        BedrockCredentialError: If credential generation or verification fails.
+        BedrockCredentialError: If a usable token cannot be obtained without a
+            destructive delete (see MANUAL_MINT_ERROR_PREFIX), or generation fails.
     """
     session = boto3.Session(region_name=SSM_REGION)
     iam_client = session.client("iam")
     ssm_client = session.client("ssm")
 
-    # Step 1: Ensure IAM user exists and check credential expiration
     _ensure_iam_user(iam_client, IAM_USER_NAME)
     existing = _get_existing_credentials(iam_client, IAM_USER_NAME)
-    credential_expiring = False
 
-    if existing and not force:
-        reusable = _find_reusable_credential(existing, min_remaining_days)
-        if not reusable:
-            credential_expiring = True
-            logger.info(f"Credential expiring within {min_remaining_days}d - will rotate.")
-
-    # Step 2: Try to reuse the token from SSM (fast path)
-    need_regenerate = False
-    if not force and not credential_expiring:
-        cached_token = _get_token_from_ssm(ssm_client, SSM_PARAMETER)
-        if cached_token:
-            if no_verify:
-                logger.info("Reusing token from SSM (verification skipped).")
-                return cached_token
-            logger.info(f"Found token in SSM ({SSM_PARAMETER}), verifying...")
-            outcome = _verify_token(cached_token)
-            if outcome is TokenVerification.VALID:
-                logger.info("Reusing valid token from SSM.")
-                return cached_token
-            if outcome is TokenVerification.INDETERMINATE:
-                # A probe that failed transiently (throttling / 5xx / network)
-                # says nothing about the token's validity. Reuse it WITHOUT
-                # rotating: rotation deletes the shared credential and 403s every
-                # concurrent run already holding this key.
-                logger.warning(
-                    "Token verification inconclusive (transient failure); "
-                    "reusing cached token without rotation."
-                )
-                return cached_token
-            # INVALID: a hard 403 after the propagation window - the key really
-            # is bad, so rotation is warranted.
-            logger.info("Token from SSM rejected by Bedrock (403). Rotating...")
-            need_regenerate = True
-        else:
-            logger.info(f"No token found in SSM ({SSM_PARAMETER}).")
-            need_regenerate = True
-
-    # Steps 3-5: Rotate gracefully (mint -> verify -> store -> delete-old) so a
-    # run holding the old key is not invalidated before the new key is proven.
-    if credential_expiring or force or need_regenerate:
+    # Operator escape hatches (--force / --reclaim-slot): deliberately allow the
+    # destructive graceful rotation. These are the ONLY paths that can reach
+    # _delete_all_credentials.
+    if force or reclaim_slot:
         return _rotate_credential(
             iam_client,
             ssm_client,
@@ -352,5 +405,47 @@ def generate_bearer_token(
             reclaim_slot=reclaim_slot or force,
         )
 
-    # Unreachable: one of reuse / rotate always returns above. Guard for safety.
-    raise BedrockCredentialError("Unable to obtain a Bedrock bearer token.")
+    # --- Worker path: never delete a credential. ---
+    cached_token = _get_token_from_ssm(ssm_client, SSM_PARAMETER)
+
+    # Bootstrap: nothing cached. Mint + store WITHOUT deleting anything.
+    if cached_token is None:
+        logger.info(f"No token found in SSM ({SSM_PARAMETER}); minting (bootstrap).")
+        return _mint_and_store_without_delete(
+            iam_client, ssm_client, existing, days=days, no_verify=no_verify
+        )
+
+    # A cached token exists. Near-expiry no longer triggers rotation: warn and
+    # use it anyway (an operator re-mints during a quiet window).
+    if existing and _find_reusable_credential(existing, min_remaining_days) is None:
+        logger.warning(
+            f"Cached Bedrock credential for '{IAM_USER_NAME}' is within "
+            f"{min_remaining_days}d of expiry. Auto-rotation is disabled on this branch; "
+            "using the cached key anyway. An operator should re-mint with "
+            "`aws-bench env creds --force` during a quiet window."
+        )
+
+    if no_verify:
+        logger.info("Reusing token from SSM (verification skipped).")
+        return cached_token
+
+    logger.info(f"Found token in SSM ({SSM_PARAMETER}), verifying...")
+    outcome = _verify_token(cached_token)
+    if outcome is TokenVerification.VALID:
+        logger.info("Reusing valid token from SSM.")
+        return cached_token
+    if outcome is TokenVerification.INDETERMINATE:
+        # A transient probe failure says nothing about validity — reuse without
+        # rotating (rotation would delete the key concurrent lanes hold).
+        logger.warning(
+            "Token verification inconclusive (transient failure); "
+            "reusing cached token without rotation."
+        )
+        return cached_token
+
+    # INVALID: a hard 403 after the IAM-propagation retry window. On this
+    # single-tenant branch we refuse rather than rotate.
+    raise _manual_mint_error(
+        "the cached Bedrock key was rejected by Bedrock (HTTP 403) after the "
+        "IAM-propagation retry window."
+    )

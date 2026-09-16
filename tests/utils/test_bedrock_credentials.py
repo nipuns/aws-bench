@@ -341,36 +341,33 @@ def test_generate_bearer_token_reuses_cached_token_that_403s_once(
     "aws_bench.utils.bedrock_credentials._verify_token",
     return_value=TokenVerification.INVALID,
 )
-def test_generate_bearer_token_rotates_when_verification_fails(
+def test_worker_path_raises_manual_mint_on_invalid_cached_token(
     mock_verify, mock_get_creds, mock_ensure
 ):
-    """A cached token rejected with a hard 403 rotates; an unusable new key raises."""
+    """Worker path: a hard-403 cached key is NOT rotated — it raises a greppable error."""
     session = boto3.Session(region_name="us-east-1")
     ssm = session.client("ssm")
 
     ssm.put_parameter(Name=SSM_PARAMETER, Value="stale-token", Type="SecureString", Overwrite=True)
 
-    fake_cred_response = {
-        "ServiceSpecificCredential": {
-            "ServiceSpecificCredentialId": "cred-new",
-            "ServiceCredentialSecret": "new-key",
-        }
-    }
+    mock_iam = MagicMock()
     original_client = session.client
 
     def _patched_client(svc, **kw):
-        if svc == "iam":
-            mock_iam = MagicMock()
-            mock_iam.create_service_specific_credential.return_value = fake_cred_response
-            return mock_iam
-        return original_client(svc, **kw)
+        return mock_iam if svc == "iam" else original_client(svc, **kw)
 
     with (
         patch("aws_bench.utils.bedrock_credentials.boto3.Session", return_value=session),
         patch.object(session, "client", side_effect=_patched_client),
     ):
-        with pytest.raises(BedrockCredentialError, match="New token failed verification"):
-            generate_bearer_token(force=False)
+        with pytest.raises(
+            BedrockCredentialError, match="BEDROCK_KEY_INVALID_MANUAL_MINT_REQUIRED"
+        ):
+            generate_bearer_token()
+
+    # No rotation on the worker path: nothing minted, nothing deleted.
+    mock_iam.create_service_specific_credential.assert_not_called()
+    mock_iam.delete_service_specific_credential.assert_not_called()
 
 
 @mock_aws
@@ -431,9 +428,12 @@ def test_generate_bearer_token_transient_verify_does_not_rotate(
 def test_rotation_keeps_old_credential_until_new_verified(
     mock_verify, mock_store, mock_get_creds, mock_ensure
 ):
-    """Graceful rotation: mint + verify + store the new key BEFORE deleting the old one."""
-    # Cached token is hard-rejected (INVALID) → rotate; the new key verifies VALID.
-    mock_verify.side_effect = [TokenVerification.INVALID, TokenVerification.VALID]
+    """Operator rotation (--reclaim-slot/--force): mint+verify+store before deleting old.
+
+    The operator path verifies only the newly minted key (the cached token is not
+    consulted), so the probe returns VALID once.
+    """
+    mock_verify.return_value = TokenVerification.VALID
     mock_get_creds.return_value = [
         {
             "Status": "Active",
@@ -475,7 +475,7 @@ def test_rotation_keeps_old_credential_until_new_verified(
         patch("aws_bench.utils.bedrock_credentials.boto3.Session", return_value=session),
         patch.object(session, "client", side_effect=_patched_client),
     ):
-        token = generate_bearer_token()
+        token = generate_bearer_token(reclaim_slot=True)
 
     assert token == "new-key"
     # The old credential is deleted, but only after the new key was minted and
@@ -490,10 +490,10 @@ def test_rotation_keeps_old_credential_until_new_verified(
     "aws_bench.utils.bedrock_credentials._verify_token",
     return_value=TokenVerification.INVALID,
 )
-def test_rotation_without_reclaim_slot_errors_when_slots_full(
+def test_worker_path_manual_mint_on_invalid_even_with_full_slots(
     mock_verify, mock_get_creds, mock_ensure
 ):
-    """With both slots full and no --reclaim-slot, rotation refuses instead of deleting."""
+    """Worker path with a dead cached key never reaches reclaim logic: it raises, no delete."""
     now = datetime.now(timezone.utc)
     mock_get_creds.return_value = [
         {
@@ -521,7 +521,9 @@ def test_rotation_without_reclaim_slot_errors_when_slots_full(
         patch("aws_bench.utils.bedrock_credentials.boto3.Session", return_value=session),
         patch.object(session, "client", side_effect=_patched_client),
     ):
-        with pytest.raises(BedrockCredentialError, match="--reclaim-slot"):
+        with pytest.raises(
+            BedrockCredentialError, match="BEDROCK_KEY_INVALID_MANUAL_MINT_REQUIRED"
+        ):
             generate_bearer_token()
 
     # Nothing destructive happened: no slot freed, no new credential minted.
@@ -537,8 +539,12 @@ def test_rotation_without_reclaim_slot_errors_when_slots_full(
 def test_rotation_with_reclaim_slot_frees_soonest_to_expire(
     mock_verify, mock_store, mock_get_creds, mock_ensure
 ):
-    """With --reclaim-slot, a full-slot rotation frees the soonest-to-expire credential first."""
-    mock_verify.side_effect = [TokenVerification.INVALID, TokenVerification.VALID]
+    """With --reclaim-slot, a full-slot rotation frees the soonest-to-expire credential first.
+
+    The operator path verifies only the newly minted key (the cached token is not
+    consulted), so the probe returns VALID once.
+    """
+    mock_verify.return_value = TokenVerification.VALID
     now = datetime.now(timezone.utc)
     mock_get_creds.return_value = [
         {
@@ -628,3 +634,119 @@ def test_generate_bearer_token_force_recreates(mock_delete, mock_get_creds, mock
         token = generate_bearer_token(force=True, no_verify=True)
 
     assert token == "fresh-key"
+
+
+@mock_aws
+@patch("aws_bench.utils.bedrock_credentials._ensure_iam_user")
+@patch("aws_bench.utils.bedrock_credentials._get_existing_credentials")
+@patch(
+    "aws_bench.utils.bedrock_credentials._verify_token",
+    return_value=TokenVerification.VALID,
+)
+def test_worker_path_reuses_near_expiry_cached_without_rotating(
+    mock_verify, mock_get_creds, mock_ensure
+):
+    """Near-expiry no longer auto-rotates: a valid-but-expiring cached key is reused as-is."""
+    mock_get_creds.return_value = [
+        {
+            "Status": "Active",
+            "ServiceSpecificCredentialId": "cred-soon",
+            "ExpirationDate": datetime.now(timezone.utc) + timedelta(hours=6),
+        }
+    ]
+    session = boto3.Session(region_name="us-east-1")
+    ssm = session.client("ssm")
+    ssm.put_parameter(Name=SSM_PARAMETER, Value="cached-token", Type="SecureString", Overwrite=True)
+
+    mock_iam = MagicMock()
+    original_client = session.client
+
+    def _patched_client(svc, **kw):
+        return mock_iam if svc == "iam" else original_client(svc, **kw)
+
+    with (
+        patch("aws_bench.utils.bedrock_credentials.boto3.Session", return_value=session),
+        patch.object(session, "client", side_effect=_patched_client),
+    ):
+        token = generate_bearer_token(min_remaining_days=1)
+
+    assert token == "cached-token"
+    mock_iam.create_service_specific_credential.assert_not_called()
+    mock_iam.delete_service_specific_credential.assert_not_called()
+
+
+@mock_aws
+@patch("aws_bench.utils.bedrock_credentials._ensure_iam_user")
+@patch("aws_bench.utils.bedrock_credentials._get_existing_credentials")
+def test_bootstrap_mint_with_free_slot_does_not_delete(mock_get_creds, mock_ensure):
+    """Bootstrap (no cached key) mints into a free slot without deleting the existing one."""
+    mock_get_creds.return_value = [
+        {
+            "Status": "Active",
+            "ServiceSpecificCredentialId": "cred-existing",
+            "ExpirationDate": datetime.now(timezone.utc) + timedelta(days=20),
+        }
+    ]
+    session = boto3.Session(region_name="us-east-1")  # empty SSM -> ParameterNotFound
+
+    fake_cred_response = {
+        "ServiceSpecificCredential": {
+            "ServiceSpecificCredentialId": "cred-new",
+            "ServiceCredentialSecret": "new-secret-key",
+        }
+    }
+    mock_iam = MagicMock()
+    mock_iam.create_service_specific_credential.return_value = fake_cred_response
+    original_client = session.client
+
+    def _patched_client(svc, **kw):
+        return mock_iam if svc == "iam" else original_client(svc, **kw)
+
+    with (
+        patch("aws_bench.utils.bedrock_credentials.boto3.Session", return_value=session),
+        patch.object(session, "client", side_effect=_patched_client),
+    ):
+        token = generate_bearer_token(no_verify=True)
+
+    assert token == "new-secret-key"
+    mock_iam.create_service_specific_credential.assert_called_once()
+    mock_iam.delete_service_specific_credential.assert_not_called()
+
+
+@mock_aws
+@patch("aws_bench.utils.bedrock_credentials._ensure_iam_user")
+@patch("aws_bench.utils.bedrock_credentials._get_existing_credentials")
+def test_bootstrap_mint_refuses_when_slots_full(mock_get_creds, mock_ensure):
+    """Bootstrap with both IAM slots full refuses (greppable error) instead of deleting."""
+    now = datetime.now(timezone.utc)
+    mock_get_creds.return_value = [
+        {
+            "Status": "Active",
+            "ServiceSpecificCredentialId": "cred-a",
+            "ExpirationDate": now + timedelta(days=10),
+        },
+        {
+            "Status": "Active",
+            "ServiceSpecificCredentialId": "cred-b",
+            "ExpirationDate": now + timedelta(days=20),
+        },
+    ]
+    session = boto3.Session(region_name="us-east-1")  # empty SSM -> ParameterNotFound
+
+    mock_iam = MagicMock()
+    original_client = session.client
+
+    def _patched_client(svc, **kw):
+        return mock_iam if svc == "iam" else original_client(svc, **kw)
+
+    with (
+        patch("aws_bench.utils.bedrock_credentials.boto3.Session", return_value=session),
+        patch.object(session, "client", side_effect=_patched_client),
+    ):
+        with pytest.raises(
+            BedrockCredentialError, match="BEDROCK_KEY_INVALID_MANUAL_MINT_REQUIRED"
+        ):
+            generate_bearer_token()
+
+    mock_iam.create_service_specific_credential.assert_not_called()
+    mock_iam.delete_service_specific_credential.assert_not_called()
