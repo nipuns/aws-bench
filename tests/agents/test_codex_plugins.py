@@ -108,6 +108,7 @@ def test_plugins_preserve_bedrock_and_mcp_config(tmp_path: Path, shell_env: dict
     assert code == 0
     assert tomllib.loads(config.read_text()) == {
         "model_provider": "amazon-bedrock",
+        "mcp_optional_startup_grace_ms": 0,
         "mcp_servers": {"tools": {"command": "uvx", "args": ["run"]}},
     }
 
